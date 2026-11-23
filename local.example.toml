@@ -1,0 +1,28 @@
+# Cấu hình riêng của máy này. Chép file này thành local.toml rồi sửa.
+# local.toml nằm trong .gitignore nên token không bị đưa lên git.
+
+[sync]
+# Kho chung để mọi máy cùng lấy save. Chọn MỘT trong ba kiểu:
+#
+# 1) Thư mục cloud (Google Drive, OneDrive, Dropbox, ổ mạng...): dễ nhất, không cần server.
+#    Mỗi máy cài app Google Drive/OneDrive và trỏ vào cùng một thư mục.
+remote = 'G:\My Drive\SaveKeeper'
+#
+# 2) Git repo (lưu tạm, nên là repo PRIVATE riêng, đừng dùng repo chứa code):
+# remote = 'https://github.com/<tên>/game-save-data.git'
+#
+# 3) SaveKeeper server của bạn (xem README, phần Server):
+# remote = 'https://save.ten-mien-cua-ban.com'
+# token = 'chuỗi bí mật giống SAVEKEEPER_TOKEN trên server'
+
+# Tên máy này hiển thị trên kho chung (để trống = tên máy tính).
+machine = ''
+
+# true = tự đẩy save lên sau mỗi lần backup, tự tải về khi máy khác có bản mới hơn.
+auto = true
+
+# Bao nhiêu phút kiểm tra kho chung một lần.
+check_minutes = 5
+
+# Mỗi game giữ bao nhiêu bản trên kho chung (kiểu thư mục và git; server có cài đặt riêng).
+keep_remote = 200

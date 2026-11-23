@@ -6,6 +6,7 @@ Tự động backup save game Steam và giữ tiến trình khi bạn chơi bằ
 - Khi **mở game**: nếu save bị thay đổi lúc bạn không chơi (thường do Steam Cloud của account khác kéo save về), SaveKeeper khôi phục bản của bạn trước khi game kịp đọc.
 - Với game lưu save **riêng theo account** (thư mục có ID account): mỗi lần đổi account, SaveKeeper tự chép tiến trình mới nhất sang account mới.
 - **Không bao giờ xoá save**: chỉ ghi đè hoặc thêm file, và trước mỗi lần ghi đè luôn giữ lại một "bản an toàn".
+- **Đồng bộ nhiều máy** (tuỳ chọn): save được đẩy lên một kho chung (thư mục cloud, git repo hoặc server riêng). Sang máy khác, SaveKeeper tự tải bản mới nhất về.
 
 Đã cấu hình sẵn: Cyberpunk 2077, The Witcher 3, The Witcher 2, The Witcher 1. Game nào chưa cài sẽ được bỏ qua.
 
@@ -38,6 +39,45 @@ File giống nhau giữa các bản chỉ được lưu một lần (hardlink), 
 
 Tự chép một file save vào thư mục game (ví dụ save tải trên mạng)? Hãy chọn **2. Backup ngay** sau đó. Nếu không, lần mở game sau SaveKeeper sẽ tưởng save bị thay đổi ngoài ý muốn và khôi phục bản cũ (bản bạn chép vào vẫn được giữ lại thành bản an toàn).
 
+## Đồng bộ nhiều máy
+
+Chép `local.example.toml` thành `local.toml` rồi điền mục `[sync]`. File này chỉ nằm trên máy của bạn và không bị đưa lên git. Có ba kiểu kho chung:
+
+| Kiểu | `remote` | Cần gì |
+|---|---|---|
+| Thư mục cloud (dễ nhất) | `'G:\My Drive\SaveKeeper'` | App Google Drive / OneDrive / Dropbox trên mỗi máy |
+| Git repo (lưu tạm) | `'https://github.com/<tên>/game-save-data.git'` | Git đã đăng nhập GitHub. Nên dùng repo **private** riêng, không dùng repo chứa code |
+| Server riêng | `'https://save.ten-mien.com'` + `token` | Một máy chủ chạy `server.py` (xem phần Server) |
+
+Sau đó chọn **4** trong menu để SaveKeeper đọc lại cấu hình. Từ đó:
+
+- Sau mỗi lần backup, bản mới được đẩy lên kho chung.
+- Cứ 5 phút (lúc không chơi) SaveKeeper hỏi kho chung. Nếu máy khác có bản mới hơn mà máy này chưa chơi thêm gì, nó tự tải về và chép vào thư mục save.
+- Nếu **cả hai máy cùng có tiến trình mới**, SaveKeeper không tự quyết. Bản của máy này được lưu lên kho làm bản phụ và bạn nhận được thông báo. Mở menu và chọn **7. Tải save từ kho chung** để lấy bản muốn chơi, hoặc **8. Đẩy save máy này lên** để dùng bản của máy này. Bản bạn chọn trở thành bản chung cho mọi máy.
+
+**Sang máy mới:** cài Python, `git clone` repo này, tạo `local.toml` như trên, mở `SaveKeeper.bat` → **4**. Save tự về sau vài giây. Muốn tải tay thì chọn **7**.
+
+Kiểu git: mỗi ngày SaveKeeper gộp lịch sử repo lại còn một commit để repo không phình to. GitHub không nhận file lớn hơn 100 MB.
+
+## Server
+
+`server.py` chỉ cần Python 3.11+, không cài thêm gì. Dữ liệu chỉ ai có token mới đọc hay ghi được.
+
+```bash
+# Trên máy chủ (Linux), trong thư mục repo:
+cp .env.example .env          # sửa SAVEKEEPER_TOKEN thành chuỗi bí mật dài
+docker compose up -d          # hoặc: SAVEKEEPER_TOKEN=... python3 server.py --data /srv/savekeeper
+```
+
+Server mặc định chỉ nghe ở `127.0.0.1:8765`. Để các máy chơi game kết nối được, chọn một trong hai cách:
+
+- **Có tên miền:** dùng [Caddy](https://caddyserver.com/) để có HTTPS tự động: `caddy reverse-proxy --from save.ten-mien.com --to 127.0.0.1:8765`. Khi đó `remote = 'https://save.ten-mien.com'`.
+- **Không có tên miền:** cài [Tailscale](https://tailscale.com/) trên server và các máy chơi game, đổi dòng `ports` trong `docker-compose.yml` thành `"<IP Tailscale>:8765:8765"`, rồi dùng `remote = 'http://<IP Tailscale>:8765'`. Kết nối Tailscale đã được mã hoá sẵn.
+
+Đừng mở cổng 8765 ra internet bằng HTTP thường, vì token sẽ đi qua mạng dưới dạng chữ thường.
+
+Server giữ 200 bản gần nhất cho mỗi game (`--keep`) và tự dọn dữ liệu cũ mỗi ngày.
+
 ## Thêm game
 
 Mở `config.toml`, chép một khối `[[games]]` rồi sửa `name`, `id`, `save_dir`, `steam_appids`, `processes`. Hướng dẫn và danh sách biến (`{documents}`, `{saved_games}`, `{steam}`, `{steam_id3}`…) có ngay trong file. Thư mục save của từng game tra trên [PCGamingWiki](https://www.pcgamingwiki.com/), mục *Save game data location*.
@@ -58,6 +98,7 @@ Mở `SaveKeeper.bat` → **5**. Kho save `vault` vẫn được giữ nguyên, 
 
 ```
 python savekeeper.py status | backup [game] | list [game] | restore [game] [bản|latest] [-y]
+python savekeeper.py sync | pull [game] [id|latest] [-y] | push [game] [-y]
 python savekeeper.py install | uninstall | run | test-notify
 ```
 
@@ -70,3 +111,5 @@ python -m unittest discover -s tests -v
 ```
 
 Bộ test giả lập Steam (đồng hồ, account, game đang chạy, Steam Cloud đè save) để kiểm tra các tình huống: backup 15 phút/lần và khi thoát, Steam Cloud đè save, đổi account, mở lại game ngay sau khi thoát, backup lỗi, khôi phục bản cũ.
+
+Phần đồng bộ được test bằng hai "máy" giả lập dùng chung cả ba kiểu kho: thư mục, git repo (bare repo cục bộ) và `server.py` thật chạy trên localhost. Các tình huống: máy mới tải về, chơi qua lại hai máy, hai máy cùng có tiến trình mới, file bị sửa trên kho, đường dẫn độc hại, token sai, hai máy đẩy lên cùng lúc.

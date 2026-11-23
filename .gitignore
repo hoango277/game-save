@@ -4,6 +4,13 @@ vault/
 *.log.*
 savekeeper.stop
 
+# Cấu hình riêng từng máy / bí mật
+local.toml
+.env
+
+# Dữ liệu khi chạy server.py trực tiếp
+server-data/
+
 # Python
 __pycache__/
 *.pyc

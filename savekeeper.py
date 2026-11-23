@@ -21,6 +21,7 @@ import logging.handlers
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -33,6 +34,8 @@ if sys.version_info < (3, 11):
     sys.exit("SaveKeeper cần Python 3.11 trở lên.")
 
 import tomllib
+
+import savestore
 
 IS_WINDOWS = os.name == "nt"
 if IS_WINDOWS:
@@ -64,6 +67,7 @@ TAG_LABELS = {
     "exit": "khi thoát game",
     "manual": "backup thủ công",
     "restore": "sau khi khôi phục",
+    "pull": "tải từ kho đồng bộ",
     "before-restore": "bản bị thay thế (giữ để an toàn)",
 }
 # Bản "an toàn" chỉ để phòng hờ, không bao giờ được dùng làm nguồn khôi phục tự động.
@@ -120,6 +124,16 @@ class GameConfig:
 
 
 @dataclasses.dataclass
+class SyncConfig:
+    remote: str                # server https://..., git repo (.git) hoặc thư mục dùng chung
+    token: str = ""
+    machine: str = ""          # tên máy này, để trống = tên máy tính
+    auto: bool = True
+    check_minutes: float = 5
+    keep_remote: int = 200
+
+
+@dataclasses.dataclass
 class Config:
     vault_dir: Path
     games: list[GameConfig]
@@ -130,6 +144,7 @@ class Config:
     poll_seconds: float = 2
     settle_seconds: float = 5
     quiet_seconds: float = 3
+    sync: SyncConfig | None = None
 
 
 def _slug(text: str) -> str:
@@ -153,13 +168,45 @@ def _str_list(raw: dict, key: str, game: str) -> list:
     return value
 
 
-def load_config(path: Path) -> Config:
+def _read_toml(path: Path) -> dict:
     try:
-        data = tomllib.loads(Path(path).read_bytes().decode("utf-8-sig"))
+        return tomllib.loads(Path(path).read_bytes().decode("utf-8-sig"))
     except FileNotFoundError:
         raise ConfigError(f"Không tìm thấy file cấu hình {path}") from None
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise ConfigError(f"File {Path(path).name} viết sai cú pháp: {e}") from None
+
+
+def _load_sync(raw, base: Path) -> SyncConfig | None:
+    if not isinstance(raw, dict):
+        raise ConfigError("Mục [sync] không hợp lệ.")
+    remote = str(raw.get("remote", "") or "").strip()
+    if not remote:
+        return None
+    token = str(raw.get("token", "") or "").strip()
+    is_git = remote.lower().startswith("git:") or remote.endswith(".git") or remote.startswith("git@")
+    if re.match(r"(?i)https?://", remote) and not is_git and len(token) < 16:
+        raise ConfigError("[sync] dùng server thì cần 'token' (ít nhất 16 ký tự, giống SAVEKEEPER_TOKEN trên server).")
+    if not is_git and not re.match(r"(?i)https?://", remote) and not Path(os.path.expandvars(remote)).is_absolute():
+        remote = str(base / os.path.expandvars(remote))
+    return SyncConfig(
+        remote=remote,
+        token=token,
+        machine=str(raw.get("machine", "") or "").strip(),
+        auto=bool(raw.get("auto", True)),
+        check_minutes=_number(raw, "check_minutes", 5, 1),
+        keep_remote=int(_number(raw, "keep_remote", 200, 10)),
+    )
+
+
+def load_config(path: Path) -> Config:
+    data = _read_toml(path)
+    local_path = Path(path).with_name("local.toml")  # cấu hình riêng của từng máy, không đưa lên git
+    if local_path.is_file():
+        local = _read_toml(local_path)
+        extra_games = local.pop("games", [])
+        data.update(local)
+        data["games"] = list(data.get("games", [])) + list(extra_games)
 
     games: list[GameConfig] = []
     seen: set[str] = set()
@@ -208,6 +255,7 @@ def load_config(path: Path) -> Config:
         poll_seconds=_number(data, "poll_seconds", 2, 0.5),
         settle_seconds=_number(data, "settle_seconds", 5, 0),
         quiet_seconds=_number(data, "quiet_seconds", 3, 0),
+        sync=_load_sync(data.get("sync", {}), Path(path).resolve().parent),
     )
 
 
@@ -293,6 +341,14 @@ def _copy_hash(src: Path, dst: Path) -> str:
             h.update(chunk)
             fout.write(chunk)
     return h.hexdigest()
+
+
+def _check_rel(rel: str) -> None:
+    """Chặn đường dẫn lạ trong danh sách file tải về (vd. '../../Windows')."""
+    parts = rel.split("/")
+    if (not rel or rel.startswith("/") or "\\" in rel or ":" in rel
+            or any(p in ("", ".", "..") for p in parts)):
+        raise SnapshotError(f"Đường dẫn file không hợp lệ: {rel!r}")
 
 
 def _make_writable(path: Path) -> None:
@@ -508,20 +564,73 @@ class Vault:
                 if not files:
                     _rmtree(tmp)
                     return "empty", None
-                ts = self.clock()
-                seq = (snaps[-1].seq + 1) if snaps else 1
-                manifest = {"seq": seq, "tag": tag, "trusted": trusted, "created_ts": ts,
-                            "created": dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
-                            "account": account, "game": game.name, "source": str(src), "files": files}
-                (tmp / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
-                final = self._final_dir(gdir, ts, tag)
-                os.rename(tmp, final)
+                snap = self._commit(game, tmp, files, tag, account, snaps, source=str(src))
             except BaseException:
                 _rmtree(tmp)
                 raise
-            snap = Snapshot(final, seq, tag, trusted, ts, account, files)
-            self.rotate(game.id)
             return "created", snap
+
+    def import_snapshot(self, game: GameConfig, files: dict, fetch, account: int = 0,
+                        extra: dict | None = None) -> Snapshot:
+        """Tạo bản backup từ danh sách file của kho đồng bộ. fetch(sha, đích) tải nội dung một file về.
+
+        File có nội dung đã nằm sẵn trong kho của máy này thì dùng lại, không tải.
+        """
+        with self._lock:
+            for rel in files:
+                _check_rel(rel)
+            snaps = self.snapshots(game.id)
+            have: dict[str, tuple[Path, int]] = {}
+            for s in snaps:
+                for rel, m in s.files.items():
+                    if m.get("sha256"):
+                        have[m["sha256"]] = (s.files_dir / rel, m["mtime_ns"])
+            gdir = self.game_dir(game.id)
+            gdir.mkdir(parents=True, exist_ok=True)
+            tmp = gdir / f".tmp-{uuid.uuid4().hex[:10]}"
+            try:
+                out: dict[str, dict] = {}
+                for rel, m in sorted(files.items()):
+                    sha, mtime = savestore.check_sha(m["sha256"]), int(m["mtime_ns"])
+                    dst = tmp / "files" / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    known = have.get(sha)
+                    linked = False
+                    if known and known[1] == mtime:
+                        try:
+                            os.link(known[0], dst)
+                            linked = True
+                        except OSError:
+                            pass
+                    if not linked:
+                        if known:
+                            shutil.copyfile(known[0], dst)
+                        else:
+                            fetch(sha, dst)
+                        if savestore.sha256_file(dst) != sha:
+                            raise SnapshotError(f"File {rel} tải về bị hỏng (sai mã sha256).")
+                        os.utime(dst, ns=(mtime, mtime))
+                    out[rel] = {"size": os.path.getsize(dst), "mtime_ns": mtime, "sha256": sha}
+                snap = self._commit(game, tmp, out, "pull", account, snaps, extra=extra)
+            except BaseException:
+                _rmtree(tmp)
+                raise
+            return snap
+
+    def _commit(self, game: GameConfig, tmp: Path, files: dict, tag: str, account: int,
+                snaps: list[Snapshot], source: str = "", extra: dict | None = None) -> Snapshot:
+        """Ghi snapshot.json rồi đổi tên thư mục tạm thành bản backup chính thức."""
+        trusted = tag not in SAFETY_TAGS
+        ts = self.clock()
+        seq = (snaps[-1].seq + 1) if snaps else 1
+        manifest = {"seq": seq, "tag": tag, "trusted": trusted, "created_ts": ts,
+                    "created": dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+                    "account": account, "game": game.name, "source": source, **(extra or {}), "files": files}
+        (tmp / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+        final = self._final_dir(self.game_dir(game.id), ts, tag)
+        os.rename(tmp, final)
+        self.rotate(game.id)
+        return Snapshot(final, seq, tag, trusted, ts, account, files)
 
     def _copy_stable(self, src: Path, dst: Path, attempts: int = 5) -> dict | None:
         """Chép một file; nếu game ghi vào file đúng lúc đang chép thì chép lại. None = file đã bị xoá."""
@@ -595,6 +704,216 @@ class Vault:
             return RestoreResult(len(todo), extras, safety)
 
 
+# ----------------------------------------------------------------------------- đồng bộ nhiều máy
+
+def _fmt_ts(ts) -> str:
+    try:
+        return dt.datetime.fromtimestamp(float(ts)).strftime("%H:%M %d/%m/%Y")
+    except (TypeError, ValueError, OSError):
+        return "?"
+
+
+def _head_doc(doc: dict) -> dict:
+    return {k: doc.get(k) for k in ("id", "machine", "created_ts", "content", "tag")}
+
+
+def describe_remote_id(sid: str) -> str:
+    """'20261123-201500-pc-nha-ab12cd34' -> '23/11/2026 20:15:00  máy pc-nha'."""
+    m = re.fullmatch(r"(\d{8})-(\d{6})-(.+)-[0-9a-f]{8}", sid)
+    if not m:
+        return sid
+    when = dt.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+    return f"{when:%d/%m/%Y %H:%M:%S}  máy {m.group(3)}"
+
+
+class Syncer:
+    """Đồng bộ kho save của máy này với kho chung (server, git repo hoặc thư mục cloud).
+
+    Mỗi game có một "head" trên kho chung = bản mà mọi máy nên dùng. Máy này nhớ mình đang
+    dựa trên head nào (vault/<game>/.sync.json):
+      * máy này có tiến trình mới, head không đổi       -> đẩy lên và chuyển head sang bản mới
+      * head đổi (máy khác vừa chơi), máy này không đổi -> tải về và chép vào thư mục save
+      * cả hai cùng đổi -> không tự quyết: đẩy bản của máy này lên làm bản phụ và báo người chơi chọn
+    """
+
+    def __init__(self, cfg: SyncConfig, store, vault: Vault, log: logging.Logger, notify):
+        self.cfg, self.store, self.vault, self.log, self.notify = cfg, store, vault, log, notify
+        self.machine = cfg.machine or os.environ.get("COMPUTERNAME") or socket.gethostname() or "may"
+
+    # ---- trạng thái của máy này
+
+    def _state_path(self, gid: str) -> Path:
+        return self.vault.game_dir(gid) / ".sync.json"
+
+    def load_state(self, gid: str) -> dict:
+        try:
+            st = json.loads(self._state_path(gid).read_text(encoding="utf-8"))
+            return st if isinstance(st, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save_state(self, gid: str, st: dict) -> None:
+        path = self._state_path(gid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+
+    @staticmethod
+    def remote_files(snap: Snapshot) -> dict:
+        files = {}
+        for rel, m in snap.files.items():
+            sha = m.get("sha256") or savestore.sha256_file(snap.files_dir / rel)
+            files[rel] = {"size": m["size"], "mtime_ns": m["mtime_ns"], "sha256": sha}
+        return files
+
+    def content_of(self, snap: Snapshot | None) -> str | None:
+        return savestore.content_id(self.remote_files(snap)) if snap else None
+
+    # ---- đẩy lên / tải về
+
+    def upload(self, g: GameConfig, snap: Snapshot, parent: str | None) -> dict:
+        """Đưa một bản backup lên kho chung (chưa đổi head)."""
+        files = self.remote_files(snap)
+        content = savestore.content_id(files)
+        by_sha = {m["sha256"]: rel for rel, m in files.items()}
+        for sha in self.store.missing(by_sha):
+            self.store.put_object(sha, snap.files_dir / by_sha[sha])
+        sid = f"{dt.datetime.fromtimestamp(snap.created_ts):%Y%m%d-%H%M%S}-{_slug(self.machine)[:24]}-{content[:8]}"
+        doc = {"id": sid, "game": g.id, "name": g.name, "machine": self.machine, "created_ts": snap.created_ts,
+               "pushed_ts": time.time(), "tag": snap.tag, "parent": parent, "content": content, "files": files}
+        self.store.put_snapshot(g.id, sid, doc)
+        return doc
+
+    def sync_game(self, g: GameConfig, save_dir: Path | None, account: int, can_write) -> str:
+        """Đồng bộ một game. can_write() cho biết lúc này có được ghi vào thư mục save không.
+
+        Trả về: in-sync | pushed | pulled | pull-pending | conflict.
+        """
+        self.store.refresh()
+        st = self.load_state(g.id)
+        local = self.vault.latest(g.id)
+        local_content = self.content_of(local)
+        head = self.store.get_head(g.id)
+        if head and local_content == head.get("content"):
+            if st.get("base") != head["id"] or st.get("content") != local_content:
+                self.save_state(g.id, {"base": head["id"], "content": local_content})
+            return "in-sync"
+        local_changed = local is not None and local_content != st.get("content")
+        remote_changed = head is not None and head.get("id") != st.get("base")
+
+        if local_changed and not remote_changed:
+            doc = self.upload(g, local, parent=st.get("base"))
+            if self.store.put_head(g.id, _head_doc(doc), expected=head["id"] if head else None):
+                self.save_state(g.id, {"base": doc["id"], "content": local_content})
+                self.log.info("%s: đã đẩy bản %s lên kho chung", g.name, doc["id"])
+                return "pushed"
+            return "conflict"  # máy khác vừa đẩy lên trước, lần kiểm tra sau sẽ xử lý
+
+        if remote_changed and not local_changed:
+            if save_dir is None or not can_write():
+                return "pull-pending"
+            self.pull(g, head["id"], save_dir, account, can_write)
+            self.notify(f"{g.name}: đã tải save mới nhất",
+                        f"Bản lúc {_fmt_ts(head.get('created_ts'))} từ máy {head.get('machine', '?')}.")
+            return "pulled"
+
+        if local_changed and remote_changed:
+            if st.get("side") != local_content:
+                self.upload(g, local, parent=st.get("base"))
+                if self.store.flush(f"{g.id}: bản phụ của {self.machine}"):
+                    st["side"] = local_content
+            if st.get("conflict") != head["id"]:
+                st["conflict"] = head["id"]
+                self.notify(f"{g.name}: có 2 tiến trình khác nhau",
+                            f"Kho chung có bản lúc {_fmt_ts(head.get('created_ts'))} từ máy {head.get('machine', '?')}, "
+                            "máy này cũng có tiến trình mới (đã lưu lên kho làm bản phụ). "
+                            "Mở SaveKeeper.bat, chọn 'Tải save từ kho chung' để chọn bản muốn chơi.")
+            self.save_state(g.id, st)
+            return "conflict"
+        return "in-sync"
+
+    def pull(self, g: GameConfig, sid: str, save_dir: Path, account: int,
+             can_write=lambda: True) -> tuple[Snapshot, RestoreResult]:
+        """Tải bản `sid` về rồi chép vào thư mục save. Sau đó bản này thành bản chung của mọi máy."""
+        doc = self.store.get_snapshot(g.id, sid)
+        if doc is None:
+            self.store.refresh()  # kho git: có thể chưa kéo bản mới về
+            doc = self.store.get_snapshot(g.id, sid)
+        if doc is None:
+            raise SnapshotError("Không thấy bản này trên kho chung.")
+        savestore.check_snapshot_doc(doc)
+        snap = self.vault.import_snapshot(g, doc["files"], self.store.get_object, account,
+                                          extra={"remote_id": sid, "remote_machine": doc.get("machine")})
+        if not can_write():
+            _rmtree(snap.path)  # game vừa được mở: để lần sau
+            raise SnapshotError(f"{g.name} đang chạy, chưa chép save vào được.")
+        res = self.vault.restore(g, snap, save_dir, account)
+        head = self.store.get_head(g.id)
+        if head and head.get("id") == sid:
+            self.save_state(g.id, {"base": sid, "content": self.content_of(snap)})
+        else:
+            # Chọn một bản cũ hoặc bản phụ: đưa nó lên làm bản chung để các máy khác cũng dùng.
+            new = self.upload(g, snap, parent=head["id"] if head else None)
+            if not self.store.put_head(g.id, _head_doc(new), expected=head["id"] if head else None):
+                raise SnapshotError("Kho chung vừa nhận bản mới từ máy khác, hãy thử lại.")
+            self.save_state(g.id, {"base": new["id"], "content": new["content"]})
+        return snap, res
+
+    def push_local(self, g: GameConfig) -> dict | None:
+        """Đưa bản mới nhất của máy này lên làm bản chung, kể cả khi máy khác có bản khác."""
+        self.store.refresh()
+        local = self.vault.latest(g.id)
+        if local is None:
+            return None
+        content = self.content_of(local)
+        head = self.store.get_head(g.id)
+        if head and head.get("content") == content:
+            self.save_state(g.id, {"base": head["id"], "content": content})
+            return head
+        doc = self.upload(g, local, parent=head["id"] if head else None)
+        if not self.store.put_head(g.id, _head_doc(doc), expected=head["id"] if head else None):
+            raise SnapshotError("Kho chung vừa nhận bản mới từ máy khác, hãy thử lại.")
+        self.save_state(g.id, {"base": doc["id"], "content": content})
+        return doc
+
+    def describe(self, g: GameConfig) -> str:
+        head = self.store.get_head(g.id)
+        if head is None:
+            return "kho chung chưa có bản nào"
+        st = self.load_state(g.id)
+        when = f"{_fmt_ts(head.get('created_ts'))} từ máy {head.get('machine', '?')}"
+        if self.content_of(self.vault.latest(g.id)) == head.get("content"):
+            return f"đã đồng bộ (bản lúc {when})"
+        if st.get("conflict") == head.get("id"):
+            return f"CÓ 2 TIẾN TRÌNH KHÁC NHAU: kho chung có bản lúc {when}, máy này có bản khác"
+        if head.get("id") != st.get("base"):
+            return f"kho chung có bản mới hơn (lúc {when}), chưa tải về"
+        return "máy này có tiến trình mới chưa đẩy lên"
+
+    def maybe_gc(self) -> None:
+        """Kho thư mục / git: mỗi ngày dọn bản cũ một lần (server tự dọn)."""
+        if isinstance(self.store, savestore.HttpStore):
+            return
+        stamp = self.vault.root / ".sync-gc"
+        try:
+            if time.time() - stamp.stat().st_mtime < 86400:
+                return
+        except FileNotFoundError:
+            pass
+        stats = self.store.gc(keep=self.cfg.keep_remote)
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        self.log.info("Dọn dẹp kho chung: %s", stats)
+
+
+def make_syncer(cfg: Config, vault: Vault, log: logging.Logger, notify) -> Syncer | None:
+    if cfg.sync is None:
+        return None
+    store = savestore.open_store(cfg.sync.remote, cfg.sync.token, git_workdir=cfg.vault_dir / ".git-store")
+    return Syncer(cfg.sync, store, vault, log, notify)
+
+
 # ----------------------------------------------------------------------------- theo dõi game
 
 @dataclasses.dataclass
@@ -608,6 +927,7 @@ class GameState:
     exit_deadline: float = 0.0
     dirty: bool = False                # tiến trình của lần chơi trước chưa được backup xong
     failures: int = 0
+    sync_pending: bool = False         # có bản backup mới cần đẩy lên kho chung
 
 
 class Watcher:
@@ -626,6 +946,9 @@ class Watcher:
         self.states = {g.id: GameState() for g in cfg.games}
         self.user = 0
         self.interval = cfg.interval_minutes * 60
+        self.syncer: Syncer | None = None
+        self.next_sync = 0.0
+        self.sync_failing = False
 
     def notify(self, title: str, body: str) -> None:
         self.log.info("Thông báo: %s | %s", title, body)
@@ -643,7 +966,55 @@ class Watcher:
             return False
         if status == "created":
             self.log.info("%s: backup %s -> %s (%d file)", g.name, TAG_LABELS.get(tag, tag), snap.name, len(snap.files))
+            self.states[g.id].sync_pending = True
         return True
+
+    # ---- đồng bộ với kho chung
+
+    def sync(self, g: GameConfig) -> None:
+        s = self.states[g.id]
+        procs = self.env.process_names()
+        st = self.env.steam_state(procs)
+
+        def can_write() -> bool:
+            p = self.env.process_names()
+            return not s.running and not s.dirty and not is_running(g, self.env.steam_state(p), p)
+
+        try:
+            result = self.syncer.sync_game(g, resolve_save_dir(g.save_dir, self.env, st.user), st.user, can_write)
+        except (savestore.StoreError, OSError) as e:
+            self.log.warning("%s: chưa đồng bộ được: %s", g.name, e)
+            if not self.sync_failing:
+                self.sync_failing = True
+                self.notify("SaveKeeper: chưa đồng bộ được", f"{e} Sẽ tự thử lại.")
+            return
+        except SnapshotError as e:
+            self.log.warning("%s: chưa đồng bộ được: %s", g.name, e)
+            return
+        except Exception:
+            self.log.exception("%s: lỗi khi đồng bộ", g.name)
+            return
+        if self.sync_failing:
+            self.sync_failing = False
+            self.log.info("Đồng bộ hoạt động trở lại.")
+        if result != "in-sync":
+            self.log.info("%s: đồng bộ -> %s", g.name, result)
+
+    def _sync_round(self, now: float) -> None:
+        if self.syncer is None or not self.syncer.cfg.auto:
+            return
+        due = now >= self.next_sync
+        for g in self.cfg.games:
+            s = self.states[g.id]
+            if s.sync_pending or due:
+                s.sync_pending = False
+                self.sync(g)
+        if due:
+            self.next_sync = now + self.syncer.cfg.check_minutes * 60
+            try:
+                self.syncer.maybe_gc()
+            except Exception as e:
+                self.log.warning("Chưa dọn được kho chung: %s", e)
 
     # ---- vòng đời
 
@@ -696,6 +1067,7 @@ class Watcher:
                         except Exception:
                             self.log.exception("%s: không chuyển được save sang account mới", g.name)
                             self.notify(f"{g.name}: lỗi chuyển save", "Không chép được save sang account mới. Xem savekeeper.log.")
+        self._sync_round(now)
 
     def shutdown(self) -> None:
         now = self.env.now()
@@ -1022,7 +1394,13 @@ def run_watcher(cfg: Config, env, log: logging.Logger) -> int:
         pass
     vault = Vault(cfg.vault_dir, cfg.keep, cfg.keep_safety, clock=env.now, log=log)
     watcher = Watcher(cfg, env, vault, log)
-    log.info("SaveKeeper bắt đầu chạy. Kho save: %s. Theo dõi %d game.", cfg.vault_dir, len(cfg.games))
+    try:
+        watcher.syncer = make_syncer(cfg, vault, log, watcher.notify)
+    except savestore.StoreError as e:
+        log.error("Không bật được đồng bộ: %s", e)
+        watcher.notify("SaveKeeper: lỗi cấu hình đồng bộ", str(e))
+    log.info("SaveKeeper bắt đầu chạy. Kho save: %s. Theo dõi %d game. Kho chung: %s",
+             cfg.vault_dir, len(cfg.games), watcher.syncer.store if watcher.syncer else "không dùng")
     watcher.startup()
     try:
         while not STOP_FLAG.exists():
@@ -1093,6 +1471,12 @@ class App:
     def __init__(self, cfg: Config, env, log: logging.Logger):
         self.cfg, self.env, self.log = cfg, env, log
         self.vault = Vault(cfg.vault_dir, cfg.keep, cfg.keep_safety, clock=env.now, log=log)
+        self.syncer = make_syncer(cfg, self.vault, log, notify=lambda title, body: print(f"[{title}] {body}"))
+
+    def _need_syncer(self) -> Syncer | None:
+        if self.syncer is None:
+            print("Chưa cấu hình kho chung. Chép local.example.toml thành local.toml, điền mục [sync] rồi chạy lại.")
+        return self.syncer
 
     def _state(self) -> tuple[SteamState, set[str]]:
         procs = self.env.process_names()
@@ -1117,6 +1501,16 @@ class App:
             print(f"Steam               : đang chạy, account ID {st.user or '(chưa đăng nhập)'}{playing}")
         else:
             print("Steam               : không chạy")
+        remote_ok = False
+        if self.syncer is None:
+            print("Kho chung           : chưa dùng (xem local.example.toml)")
+        else:
+            print(f"Kho chung           : {self.syncer.store}  (máy này: {self.syncer.machine})")
+            try:
+                self.syncer.store.refresh()
+                remote_ok = True
+            except savestore.StoreError as e:
+                print(f"                      KHÔNG KẾT NỐI ĐƯỢC: {e}")
         for g in self.cfg.games:
             path = resolve_save_dir(g.save_dir, self.env, st.user)
             snaps = self.vault.snapshots(g.id)
@@ -1131,6 +1525,88 @@ class App:
                 print(f"    Số bản      : {len(trusted)} bản thường, {len(snaps) - len(trusted)} bản an toàn")
             else:
                 print("    Chưa có bản backup nào.")
+            if remote_ok:
+                try:
+                    print(f"    Kho chung   : {self.syncer.describe(g)}")
+                except savestore.StoreError as e:
+                    print(f"    Kho chung   : lỗi {e}")
+        return 0
+
+    def sync_now(self) -> int:
+        syncer = self._need_syncer()
+        if syncer is None:
+            return 1
+        labels = {"in-sync": "đã đồng bộ", "pushed": "đã đẩy bản mới lên", "pulled": "đã tải bản mới về",
+                  "pull-pending": "có bản mới nhưng chưa tải được (game đang chạy hoặc chưa đăng nhập Steam)",
+                  "conflict": "CÓ 2 TIẾN TRÌNH KHÁC NHAU: chọn 'Tải save từ kho chung' hoặc 'Đẩy save máy này lên'"}
+        st, procs = self._state()
+        for g in self.cfg.games:
+            running = is_running(g, st, procs)
+            result = syncer.sync_game(g, resolve_save_dir(g.save_dir, self.env, st.user), st.user,
+                                      can_write=lambda: not running)
+            print(f"- {g.name}: {labels.get(result, result)}")
+        return 0
+
+    def pull(self, game_key: str | None = None, sid: str | None = None, yes: bool = False) -> int:
+        syncer = self._need_syncer()
+        if syncer is None:
+            return 1
+        g = self.find_game(game_key)
+        if g is None:
+            return 1
+        syncer.store.refresh()
+        ids = syncer.store.list_snapshots(g.id)
+        head = syncer.store.get_head(g.id)
+        if not ids:
+            print(f"Kho chung chưa có save của {g.name}.")
+            return 1
+        head_id = head.get("id") if head else None
+        if not sid:
+            sid = _pick(list(reversed(ids))[:30],
+                        lambda i: describe_remote_id(i) + ("   [BẢN CHUNG HIỆN TẠI]" if i == head_id else ""),
+                        f"Các bản của {g.name} trên kho chung (mới nhất ở trên):")
+        elif sid == "latest":
+            sid = head_id
+        if not sid or sid not in ids:
+            print("Đã huỷ hoặc không tìm thấy bản này.")
+            return 1
+        st, procs = self._state()
+        if is_running(g, st, procs):
+            print(f"{g.name} đang chạy. Hãy thoát game rồi tải về.")
+            return 1
+        dest = resolve_save_dir(g.save_dir, self.env, st.user)
+        if dest is None:
+            print("Game này lưu save theo account: hãy mở Steam, đăng nhập rồi chạy lại.")
+            return 1
+        print(f"\nSẽ tải bản [{describe_remote_id(sid)}] và chép vào:\n  {dest}")
+        print("Save hiện tại sẽ được giữ lại một bản trong kho trước khi bị ghi đè.")
+        if not yes and _ask("Tiếp tục? (c/k): ").lower() not in ("c", "co", "có", "y", "yes"):
+            print("Đã huỷ.")
+            return 1
+        _snap, res = syncer.pull(g, sid, dest, st.user)
+        print(f"Xong: đã chép {res.restored} file. Bản này giờ là bản chung cho mọi máy.")
+        if res.safety:
+            print(f"Save cũ của máy này được giữ ở: {res.safety.path}")
+        return 0
+
+    def push(self, game_key: str | None = None, yes: bool = False) -> int:
+        syncer = self._need_syncer()
+        if syncer is None:
+            return 1
+        g = self.find_game(game_key)
+        if g is None:
+            return 1
+        local = self.vault.latest(g.id)
+        if local is None:
+            print(f"Máy này chưa có bản backup nào của {g.name}.")
+            return 1
+        print(f"Sẽ đưa bản [{local.label()}] của máy này lên làm bản chung cho mọi máy.")
+        print("Bản chung cũ vẫn được giữ trên kho, có thể chọn lại sau.")
+        if not yes and _ask("Tiếp tục? (c/k): ").lower() not in ("c", "co", "có", "y", "yes"):
+            print("Đã huỷ.")
+            return 1
+        doc = syncer.push_local(g)
+        print(f"Xong: bản chung hiện tại là {describe_remote_id(doc['id'])}.")
         return 0
 
     def backup(self, game_key: str | None = None) -> int:
@@ -1211,6 +1687,9 @@ class App:
             ("Khôi phục save từ kho", self.restore),
             ("Bật SaveKeeper chạy nền + tự chạy cùng Windows (chọn lại sau khi sửa config)", install),
             ("Tắt SaveKeeper và bỏ tự chạy cùng Windows", uninstall),
+            ("Đồng bộ với kho chung ngay", self.sync_now),
+            ("Tải save từ kho chung về máy này (máy mới / chọn bản khác)", self.pull),
+            ("Đẩy save máy này lên làm bản chung", self.push),
         ]
         while True:
             print("\n================ SaveKeeper ================")
@@ -1227,6 +1706,8 @@ class App:
                 print()
                 try:
                     actions[int(answer) - 1][1]()
+                except (SnapshotError, savestore.StoreError) as e:
+                    print(f"LỖI: {e}")
                 except Exception as e:  # menu không được chết vì một lỗi
                     self.log.exception("Lỗi trong menu")
                     print(f"LỖI: {e}")
@@ -1297,6 +1778,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("game", nargs="?")
     p.add_argument("snapshot", nargs="?", help="tên bản backup, hoặc 'latest'")
     p.add_argument("-y", "--yes", action="store_true", help="không hỏi xác nhận")
+    sub.add_parser("sync", help="đồng bộ với kho chung ngay")
+    p = sub.add_parser("pull", help="tải save từ kho chung về máy này")
+    p.add_argument("game", nargs="?")
+    p.add_argument("snapshot", nargs="?", help="id bản trên kho chung, hoặc 'latest'")
+    p.add_argument("-y", "--yes", action="store_true", help="không hỏi xác nhận")
+    p = sub.add_parser("push", help="đưa save máy này lên làm bản chung")
+    p.add_argument("game", nargs="?")
+    p.add_argument("-y", "--yes", action="store_true", help="không hỏi xác nhận")
     sub.add_parser("install", help="chạy nền ngay và tự chạy cùng Windows")
     sub.add_parser("uninstall", help="tắt và bỏ tự chạy cùng Windows")
     sub.add_parser("test-notify", help="hiện thử một thông báo")
@@ -1334,8 +1823,14 @@ def main(argv: list[str] | None = None) -> int:
             return app.list_snapshots(args.game)
         if command == "restore":
             return app.restore(args.game, args.snapshot, args.yes)
+        if command == "sync":
+            return app.sync_now()
+        if command == "pull":
+            return app.pull(args.game, args.snapshot, args.yes)
+        if command == "push":
+            return app.push(args.game, args.yes)
         return app.menu()
-    except SnapshotError as e:
+    except (SnapshotError, savestore.StoreError) as e:
         print(f"LỖI: {e}")
         return 1
 

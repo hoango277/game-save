@@ -1,0 +1,16 @@
+# SaveKeeper server.  Chạy:  cp .env.example .env  (sửa token)  rồi  docker compose up -d
+services:
+  savekeeper:
+    build: .
+    restart: unless-stopped
+    environment:
+      SAVEKEEPER_TOKEN: ${SAVEKEEPER_TOKEN:?Hay dat SAVEKEEPER_TOKEN trong file .env}
+    ports:
+      # Mặc định chỉ mở trong máy chủ; đặt Caddy phía trước để có HTTPS (xem README).
+      # Dùng Tailscale thì đổi thành "<IP Tailscale của server>:8765:8765".
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - savekeeper-data:/data
+
+volumes:
+  savekeeper-data:
