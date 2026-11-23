@@ -1,0 +1,9 @@
+# Kho save và file sinh ra khi chạy
+vault/
+*.log
+*.log.*
+savekeeper.stop
+
+# Python
+__pycache__/
+*.pyc

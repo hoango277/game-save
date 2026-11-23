@@ -1,0 +1,88 @@
+# =====================================================================
+#  SaveKeeper - file cấu hình
+#  Sửa xong: mở SaveKeeper.bat -> chọn mục 4 để SaveKeeper nhận cấu hình mới.
+# =====================================================================
+
+# Thư mục kho save. Để trống = thư mục "vault" nằm cạnh file này.
+# Ví dụ: vault_dir = 'E:\Backup\GameSaves'
+# Không nên đặt trong OneDrive / Google Drive.
+vault_dir = ''
+
+# Bao nhiêu phút backup một lần khi đang chơi (ngoài ra luôn backup ngay khi thoát game).
+interval_minutes = 15
+
+# Mỗi game giữ tối đa bao nhiêu bản backup (bản cũ nhất tự xoá).
+# File giống nhau giữa các bản chỉ lưu một lần nên không tốn nhiều dung lượng.
+keep = 50
+
+# "Bản an toàn" = save bị thay thế mỗi lần SaveKeeper khôi phục. Giữ tối đa:
+keep_safety = 20
+
+# Hiện thông báo Windows khi SaveKeeper khôi phục save hoặc gặp lỗi.
+notifications = true
+
+# ---------------------------------------------------------------------
+#  Danh sách game. Mỗi game là một khối [[games]]:
+#
+#  name          Tên hiển thị.
+#  id            Tên thư mục trong kho (chữ không dấu, không khoảng trắng).
+#  save_dir      Thư mục chứa save. Dùng được các biến:
+#                  {documents}     thư mục Documents (đúng cả khi OneDrive chuyển chỗ)
+#                  {saved_games}   C:\Users\<bạn>\Saved Games
+#                  {appdata}       C:\Users\<bạn>\AppData\Roaming
+#                  {localappdata}  C:\Users\<bạn>\AppData\Local
+#                  {locallow}      C:\Users\<bạn>\AppData\LocalLow
+#                  {home}          C:\Users\<bạn>
+#                  {steam}         thư mục cài Steam
+#                  {steam_id3}     ID account Steam đang đăng nhập (dạng ngắn, vd 123456789)
+#                  {steam_id64}    ID account Steam dạng dài (7656119...)
+#                Game có {steam_id3} hoặc {steam_id64} trong save_dir = save riêng theo account.
+#                Với game đó, mỗi lần bạn đổi account SaveKeeper tự chép save mới nhất sang.
+#  steam_appids  AppID của game, là con số trong link store.steampowered.com/app/<AppID>.
+#  processes     Tên file .exe của game, để nhận ra game đang chạy.
+#  guard         true (mặc định): lúc mở game, nếu save bị đổi khi bạn không chơi
+#                (thường do Steam Cloud) thì tự khôi phục bản của bạn.
+#  exclude       (không bắt buộc) bỏ qua file khớp mẫu, ví dụ ["*.log"].
+#  enabled       false = tạm bỏ qua game này.
+#
+#  Đường dẫn để trong dấu nháy đơn '...' để không phải gõ \\ hai lần.
+#  Game chưa cài hoặc chưa có save thì SaveKeeper tự bỏ qua.
+# ---------------------------------------------------------------------
+
+[[games]]
+name = "Cyberpunk 2077"
+id = "cyberpunk2077"
+save_dir = '{saved_games}\CD Projekt Red\Cyberpunk 2077'
+steam_appids = [1091500]
+processes = ["Cyberpunk2077.exe"]
+
+[[games]]
+name = "The Witcher 3: Wild Hunt"
+id = "witcher3"
+save_dir = '{documents}\The Witcher 3\gamesaves'
+steam_appids = [292030, 499450]
+processes = ["witcher3.exe"]
+
+[[games]]
+name = "The Witcher 2"
+id = "witcher2"
+save_dir = '{documents}\Witcher 2\gamesaves'
+steam_appids = [20920]
+processes = ["witcher2.exe"]
+
+[[games]]
+name = "The Witcher (Enhanced Edition)"
+id = "witcher1"
+save_dir = '{documents}\The Witcher\saves'
+steam_appids = [20900]
+processes = ["witcher.exe"]
+
+# Mẫu cho game lưu save riêng theo từng account Steam
+# (bỏ dấu # ở đầu các dòng, thay 123456 bằng AppID của game):
+#
+# [[games]]
+# name = "Tên game"
+# id = "ten-game"
+# save_dir = '{steam}\userdata\{steam_id3}\123456\remote'
+# steam_appids = [123456]
+# processes = ["game.exe"]
